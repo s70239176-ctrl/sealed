@@ -91,3 +91,17 @@ export async function write(client, address, functionName, args, value = 0n, wai
   }
   return { hash, status: "TIMEOUT", tx: null, revert: null };
 }
+
+/**
+ * A view call with LONG arguments (more than ~200 bytes). On Studionet with genlayer-js 1.1.8, readContract fails with
+ * "RLP string ends with N superfluous bytes" once the argument bytes pass roughly 200, while simulateWriteContract
+ * (the same gen_call, type "write") handles them. Use this for lint_criteria / dry_run.
+ */
+export async function sim(client, address, functionName, args = []) {
+  const unbig = (v) =>
+    typeof v === "bigint" ? Number(v) : Array.isArray(v) ? v.map(unbig)
+    : v instanceof Map ? Object.fromEntries([...v].map(([k, x]) => [String(k), unbig(x)]))
+    : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unbig(x)]))
+    : v;
+  return unbig(await paced(() => client.simulateWriteContract({ address, functionName, args })));
+}

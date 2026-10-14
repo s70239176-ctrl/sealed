@@ -2,38 +2,48 @@
 
 An RFP whose sponsor provably could not steer the award. The sponsor locks funds and freezes typed yes/no
 criteria before any bid exists; a jury of GenLayer validators fetches each bid page and agrees on the exact bit
-vector; the payout is a table in code (none eligible: refund, one: paid, several: lowest price wins or split).
-No admin key, and the sponsor cannot cancel, edit, pick a winner or bid.
+vector; the payout is a table in code. No admin key, and the sponsor cannot cancel, edit, pick a winner or bid.
 
-Criterion kinds: `contains`, `license`, `price_max`, `deliverable` (all checked by code) and `question` (a yes/no fact,
-the only model-judged kind; taste words are refused at setup). Design notes are in the contract docstring.
+**Criteria** (all code-checked except the last): `contains`, `license`, `price_max`, `deliverable`, and `question`, a
+yes/no fact about the page and the only model-judged kind. Taste words are refused at setup.
+
+**v2 mechanics**
+
+- **Sealed prices.** A bid commits to `sha256(rfp|bidder|price|salt)` and reveals it after bidding closes, so nobody can
+  undercut a visible price. A bid that never reveals is ineligible and never reaches the jury.
+- **Locked content.** A bid commits to the hash of its cleaned page. A page edited afterwards is ineligible.
+- **Bond.** Every bid posts the RFP's bond. If nobody wins, everyone gets their bond back. If someone wins, the bonds
+  of ineligible bids join the prize. The sponsor never receives a bond, so failing bidders cannot profit a sponsor.
+- **Award.** none eligible: pool back to the sponsor; one: paid; several: lowest revealed price wins (equal lowest
+  prices split) or `split` divides among all eligible.
+- **Linter.** `lint_criteria` and `dry_run` are free views running the contract's own code, so a sponsor can test
+  criteria on sample pages (and get the page hash a bid must commit to) before locking funds.
 
 ## Deployment (GenLayer Studio, `studionet`, chain id 61999)
 
 - RPC: https://studio.genlayer.com/api
-- Contract: `0xAA6731BFA1920ecb5aF8652047EDbb10806307bc` (retry gap 60 s; hardened build, see the injection test below)
-- Live demo log: [docs/e2e-last-run.log](docs/e2e-last-run.log) (run on the earlier, unhardened deployment `0x09f8...F7A9`, RFP 2: two compliant bids, one begging bid that
-  fails four of five bits; the cheapest eligible bid was paid 3000 and the contract ended at balance 0).
+- Contract (v2): `0x364F0979E0e7CE27f6AF8eC5AC9Ecf05967D96Be` (retry gap 60 s)
+- Live run: [docs/e2e-v2.log](docs/e2e-v2.log). Four bids: A orders the jury to answer true, B tries to close the page
+  block and forge the answer JSON, C honestly names an auditor and is the dearest, D is the cheapest and compliant but
+  never reveals. A and B fail only the auditor bit, D is ineligible, C is paid the 3000 pool plus 300 of forfeited
+  bonds and gets its own bond back (3400 total); the contract ends at balance 0.
+- Earlier v1 logs (`docs/e2e-last-run.log`, `docs/e2e-injection.log`) are kept for the history.
 
 ## Run
 
     pip install -r requirements.txt
-    PYTHONPATH=scripts python -m pytest -p windows_direct_plugin   # 55 tests (drop the plugin off Windows)
-    npm install && node scripts/deploy.mjs 60 && node scripts/e2e.mjs
+    PYTHONPATH=scripts python -m pytest -p windows_direct_plugin   # 90 tests (drop the plugin off Windows)
+    npm install && node scripts/deploy.mjs 60 && node scripts/e2e-v2.mjs
+
+## Client notes
+
+`readContract` fails on Studionet once argument bytes pass ~200 ("RLP string ends with N superfluous bytes");
+use `simulateWriteContract` for `lint_criteria` and `dry_run` (see `sim()` in `scripts/chain-lib.mjs`).
+Payouts land when the settling transaction FINALIZES, not at ACCEPTED.
 
 ## Known limits
 
-Taste filtering of `question` criteria is a word-list floor, not a proof. A bid page is judged at evaluation time and
-can change afterwards. A page that never loads after 3 attempts is ineligible. Bid pages in the demo are served by
-httpbin.org/base64. Studionet is a test network; no frontend yet.
-
-## Injection test (live)
-
-[scripts/e2e-injection.mjs](scripts/e2e-injection.mjs), log in [docs/e2e-injection.log](docs/e2e-injection.log).
-Two bids pass all four code-checked bits, name no auditor, and attack the one model-judged bit: A orders the jury to
-answer true; B tries to close the page block and forge the answer JSON. A control bid honestly names an auditor and
-is the most expensive. Result: A and B scored `[true,true,true,true,false]` (ineligible), the control scored all
-true, and the control was paid the full pool although both attackers were far cheaper. One run, one model set: it is
-evidence, not a proof. It passed on the first deployment (RFP 3 there) with no delimiter handling; the contract then
-got `defang()`, which breaks `<<<` / `>>>` in page text before it reaches the prompt (unit-tested), and the same run was
-repeated on the redeployed contract above with the same result: attackers ineligible, control paid 3000.
+The `question` word-list taste filter is a floor, not a proof. Injection resistance is evidence from a few live runs,
+not an audit. A page that never loads after 3 attempts is ineligible. A sponsor can still bid from a second wallet
+(the receipt page should surface same-funder patterns). Demo bid pages are served by httpbin.org/base64. Studionet is
+a test network, there is no frontend yet, and no external review has been done.
