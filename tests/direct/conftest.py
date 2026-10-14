@@ -1,4 +1,4 @@
-"""Shared helpers for Sealed Direct Mode tests."""
+"""Shared helpers for Sealed Direct Mode tests (contract v2: sealed prices, locked content, bonds)."""
 import json
 import re
 import sys
@@ -7,13 +7,20 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 CONTRACT = "contracts/sealed.py"
+MODULE = "_contract_sealed"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 NOW0 = int(T0.timestamp())
 DAY = 86400
 HOUR = 3600
 RETRY_GAP = HOUR
 POOL = 90000
+BOND = 100
+REVEAL = 2 * HOUR
 DEADLINE = NOW0 + 7 * DAY
+REVEAL_END = DEADLINE + REVEAL
+# offsets from T0, for world.at()
+T_REVEAL = 7 * DAY + 1  # first second of the reveal window
+T_EVAL = 7 * DAY + REVEAL + 1  # first second evaluation is allowed
 
 CRITERIA = [
     {"kind": "contains", "text": "Security considerations"},
@@ -58,13 +65,17 @@ def hexof(addr) -> str:
     return str(addr).lower()
 
 
+def module():
+    return sys.modules[MODULE]
+
+
 class Refused(Exception):
     pass
 
 
 @pytest.fixture
 def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
-    """alice = sponsor, bob/charlie = bidders (dave is derived for a third bid)."""
+    """alice = sponsor, bob/charlie = bidders."""
     direct_vm.strict_mocks = True
     for a in (direct_alice, direct_bob, direct_charlie):
         direct_vm.deal(a, 10**9)
@@ -106,21 +117,58 @@ def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
         llm_prompts = prompts
         pages = {}  # url -> html, or None for "does not load"
         answers = [True]  # what the stubbed jury answers to the question bits
+        salts = {}  # bid id -> (price, salt)
+        deposited = 0
 
+        # ------------------------------------------------------------ actions
         @classmethod
-        def create(cls, pool=POOL, criteria=None, tie="lowest", deadline=DEADLINE, sender=None):
+        def create(cls, pool=POOL, criteria=None, tie="lowest", deadline=DEADLINE, reveal=REVEAL, bond=BOND, sender=None):
             direct_vm.sender = sender or direct_alice
             direct_vm.value = pool
-            res = contract.create_rfp("Grant RFP", json.dumps(criteria if criteria is not None else CRITERIA), tie, deadline)
+            res = contract.create_rfp(
+                "Grant RFP", json.dumps(criteria if criteria is not None else CRITERIA), tie, deadline, reveal, bond
+            )
             direct_vm.value = 0
+            cls.deposited += pool
             if not res["ok"]:
                 raise Refused(res["reason"])
             return res["id"]
 
         @classmethod
-        def bid(cls, rid, url, price, sender):
+        def page_hash(cls, html) -> str:
+            m = module()
+            return m.content_hash(m.clean_page(html.encode("utf-8")))
+
+        @classmethod
+        def commit(cls, rid, who, price, salt="salt") -> str:
+            return module().price_commitment(int(rid), hexof(who), int(price), salt)
+
+        @classmethod
+        def bid(cls, rid, url, price, sender, page=None, salt="salt", value=BOND, commit=None, phash=None, register=True):
+            """Submit a sealed bid. `page` defaults to whatever is registered for the URL."""
+            if register and page is not None:
+                cls.pages[url] = page
+            html = cls.pages.get(url) if page is None else page
             direct_vm.sender = sender
-            return contract.submit_bid(rid, url, price)
+            direct_vm.value = value
+            res = contract.submit_bid(
+                rid,
+                url,
+                commit if commit is not None else cls.commit(rid, sender, price, salt),
+                phash if phash is not None else cls.page_hash(html if html is not None else "a page that never loaded"),
+            )
+            direct_vm.value = 0
+            cls.deposited += value
+            if not res["ok"]:
+                raise Refused(res["reason"])
+            cls.salts[res["id"]] = (price, salt)
+            return res["id"]
+
+        @classmethod
+        def reveal(cls, bid_id, sender, price=None, salt=None):
+            p, s = cls.salts[bid_id]
+            direct_vm.sender = sender
+            return contract.reveal_price(bid_id, p if price is None else price, s if salt is None else salt)
 
         @staticmethod
         def reset_mocks():
@@ -145,10 +193,16 @@ def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
             direct_vm.sender = sender or direct_charlie
             return contract.evaluate_bid(bid_id)
 
+        @classmethod
+        def settle(cls, rid, sender=None):
+            direct_vm.sender = sender or direct_charlie
+            return contract.settle(rid)
+
         @staticmethod
         def at(seconds: int):
             set_clock(direct_vm, seconds)
 
+        # -------------------------------------------------------------- reads
         @classmethod
         def paid_to(cls, who) -> int:
             return sum(t["value"] for t in transfers if t["to"] == hexof(who))
@@ -159,4 +213,6 @@ def world(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
 
     World.pages = {REPO: "repo readme", "https://github.com/acme/other": "other readme"}
     World.answers = [True]
+    World.salts = {}
+    World.deposited = 0
     return World

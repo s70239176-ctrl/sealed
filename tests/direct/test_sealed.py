@@ -1,23 +1,34 @@
-"""Sealed contract tests (genlayer-test Direct Mode)."""
+"""Sealed contract tests (genlayer-test Direct Mode), v2."""
 import json
 
 import pytest
 
-from conftest import (CRITERIA, DAY, DEADLINE, GOOD_A, GOOD_B, INJECT, POOL, REPO, Refused)
+from conftest import (BOND, CRITERIA, DAY, DEADLINE, GOOD_A, GOOD_B, HOUR, INJECT, POOL, REPO, REVEAL, REVEAL_END,
+                      T_EVAL, T_REVEAL, Refused, hexof)
 
 A_URL, B_URL, X_URL = "https://bids.example.org/a", "https://bids.example.org/b", "https://bids.example.org/x"
 
 
-def after_deadline(world, extra=0):
-    world.at(8 * DAY + extra)
+def ready(world):
+    """Reveal window closed: evaluation and settlement are allowed."""
+    world.at(T_EVAL)
 
 
-def two_good_bids(world, price_a=40000, price_b=30000, tie="lowest"):
+def two_good_bids(world, price_a=40000, price_b=30000, tie="lowest", reveal=True):
     world.pages.update({A_URL: GOOD_A, B_URL: GOOD_B})
     rid = world.create(tie=tie)
     a = world.bid(rid, A_URL, price_a, world.bob)
     b = world.bid(rid, B_URL, price_b, world.charlie)
+    if reveal:
+        world.at(T_REVEAL)
+        world.reveal(a, world.bob)
+        world.reveal(b, world.charlie)
     return rid, a, b
+
+
+def conserved(world):
+    """Every unit the contract received is accounted for once the RFP has settled."""
+    assert world.total_paid() == world.deposited
 
 
 class TestSetup:
@@ -25,7 +36,13 @@ class TestSetup:
         rid = world.create()
         r = world.c.get_rfp(rid)
         assert r["criteria"] == CRITERIA and r["pool"] == POOL and r["status"] == "OPEN"
-        assert r["tie_rule"] == "lowest" and r["bid_deadline"] == DEADLINE
+        assert r["tie_rule"] == "lowest" and r["bid_deadline"] == DEADLINE and r["reveal_deadline"] == REVEAL_END
+        assert r["bond"] == BOND and len(r["criteria_hash"]) == 64
+
+    def test_criteria_hash_is_stable_and_matches_the_lint_view(self, world):
+        rid = world.create()
+        lint = world.c.lint_criteria(json.dumps(CRITERIA))
+        assert lint["ok"] and lint["hash"] == world.c.get_rfp(rid)["criteria_hash"]
 
     @pytest.mark.parametrize(
         "criteria,reason",
@@ -48,8 +65,21 @@ class TestSetup:
             world.create(criteria=criteria)
         assert str(e.value) == reason
         assert world.paid_to(world.alice) == POOL
+        # the free linter says the same thing the paid call would
+        assert world.c.lint_criteria(json.dumps(criteria))["reason"] == reason
 
-    @pytest.mark.parametrize("kw,reason", [({"pool": 0}, "empty pool"), ({"tie": "coinflip"}, "bad tie rule"), ({"deadline": 5}, "bad deadline")])
+    @pytest.mark.parametrize(
+        "kw,reason",
+        [
+            ({"pool": 0}, "empty pool"),
+            ({"tie": "coinflip"}, "bad tie rule"),
+            ({"deadline": 5}, "bad deadline"),
+            ({"reveal": 59}, "bad reveal window"),
+            ({"reveal": 15 * DAY}, "bad reveal window"),
+            ({"bond": 0}, "bad bond"),
+            ({"bond": POOL + 1}, "bad bond"),
+        ],
+    )
     def test_other_invalid_setups_refund(self, world, kw, reason):
         with pytest.raises(Refused) as e:
             world.create(**kw)
@@ -60,41 +90,144 @@ class TestSetup:
         rid = world.create()
         for name in ("cancel", "cancel_rfp", "withdraw", "set_winner", "update_criteria", "award"):
             assert not hasattr(world.c, name), name
-        world.vm.sender = world.alice
-        with world.vm.expect_revert("sponsor cannot bid"):
-            world.c.submit_bid(rid, A_URL, 1000)
+        with pytest.raises(Refused) as e:
+            world.bid(rid, A_URL, 1000, world.alice, page=GOOD_A)
+        assert str(e.value) == "sponsor cannot bid" and world.paid_to(world.alice) == BOND
 
 
-class TestBids:
+class TestLinterViews:
+    def test_lint_warns_without_refusing(self, world):
+        crit = [{"kind": "contains", "text": "ab"}, {"kind": "deliverable", "prefix": "https://github.com/"},
+                {"kind": "contains", "text": "ab"}, {"kind": "license", "allowed": ["MIT"]}]
+        out = world.c.lint_criteria(json.dumps(crit))
+        assert out["ok"]
+        texts = [w["warning"] for w in out["warnings"]]
+        assert any("very short" in t for t in texts) and any("duplicate" in t for t in texts)
+        assert any("broad prefix" in t for t in texts) and any("one license" in t for t in texts)
+
+    def test_dry_run_uses_the_contract_code_and_reports_the_commitment_hash(self, world):
+        out = world.c.dry_run(json.dumps(CRITERIA), 40000, GOOD_A)
+        assert out["ok"] and out["bits"] == [True, True, True, None, None]
+        assert out["page_hash"] == world.page_hash(GOOD_A)
+        miss = world.c.dry_run(json.dumps(CRITERIA), 60000, GOOD_A.replace("MIT", "GPL-3.0"))
+        assert miss["bits"] == [True, False, False, None, None]
+        bad = world.c.dry_run(json.dumps([{"kind": "question", "text": "Is it the best?"}]), 1, "x")
+        assert bad["ok"] is False and bad["reason"] == "criterion needs taste"
+
+    def test_commitment_helper_matches_the_rule(self, world):
+        assert world.c.commitment_for(1, hexof(world.bob), 5, "s") == world.commit(1, world.bob, 5, "s")
+
+
+class TestSealedBids:
+    def test_a_bid_stores_only_a_commitment_not_the_price(self, world):
+        rid = world.create()
+        bid = world.bid(rid, A_URL, 12345, world.bob, page=GOOD_A)
+        b = world.c.get_bid(bid)
+        assert b["price"] is None and b["status"] == "COMMITTED" and len(b["price_commit"]) == 64
+        assert "12345" not in json.dumps(b) and b["bond"] == BOND
+
+    @pytest.mark.parametrize(
+        "kw,reason",
+        [
+            ({"value": BOND - 1}, "bond mismatch"),
+            ({"value": BOND + 1}, "bond mismatch"),
+            ({"value": 0}, "bond mismatch"),
+            ({"commit": "zz"}, "bad commitment"),
+            ({"phash": "A" * 64}, "bad page hash"),
+        ],
+    )
+    def test_refused_bids_return_the_exact_value(self, world, kw, reason):
+        rid = world.create()
+        with pytest.raises(Refused) as e:
+            world.bid(rid, A_URL, 1000, world.bob, page=GOOD_A, **kw)
+        assert str(e.value) == reason and world.paid_to(world.bob) == kw.get("value", BOND)
+
     def test_bid_rules(self, world):
         rid = world.create()
-        world.bid(rid, A_URL, 1000, world.bob)
-        with world.vm.expect_revert("already bid"):
-            world.bid(rid, B_URL, 1000, world.bob)
-        for url, price, reason in [("http://x.example/a", 5, "bad url"), ("https://127.0.0.1/a", 5, "bad url"), (B_URL, 0, "bad price")]:
-            with world.vm.expect_revert(reason):
-                world.bid(rid, url, price, world.charlie)
+        world.bid(rid, A_URL, 1000, world.bob, page=GOOD_A)
+        for url, reason in [(A_URL, "already bid")]:
+            with pytest.raises(Refused) as e:
+                world.bid(rid, url, 1000, world.bob, page=GOOD_A)
+            assert str(e.value) == reason
+        for url, reason in [("http://x.example/a", "bad url"), ("https://127.0.0.1/a", "bad url")]:
+            with pytest.raises(Refused) as e:
+                world.bid(rid, url, 5, world.charlie, page=GOOD_B)
+            assert str(e.value) == reason
         world.at(8 * DAY)
-        with world.vm.expect_revert("bidding closed"):
-            world.bid(rid, B_URL, 5, world.charlie)
+        with pytest.raises(Refused) as e:
+            world.bid(rid, B_URL, 5, world.charlie, page=GOOD_B)
+        assert str(e.value) == "bidding closed"
+        assert world.paid_to(world.charlie) == 3 * BOND  # every refusal refunded in full
 
-    def test_cannot_evaluate_before_the_deadline(self, world):
+    def test_reveal_must_match_and_only_the_bidder_can_reveal(self, world):
         rid = world.create()
-        bid = world.bid(rid, A_URL, 1000, world.bob)
-        world.pages[A_URL] = GOOD_A
+        bid = world.bid(rid, A_URL, 1000, world.bob, page=GOOD_A, salt="mine")
+        world.vm.sender = world.bob
+        with world.vm.expect_revert("bidding still open"):
+            world.c.reveal_price(bid, 1000, "mine")
+        world.at(T_REVEAL)
+        with world.vm.expect_revert("not your bid"):
+            world.reveal(bid, world.charlie)
+        with world.vm.expect_revert("commitment mismatch"):
+            world.reveal(bid, world.bob, price=999)
+        with world.vm.expect_revert("commitment mismatch"):
+            world.reveal(bid, world.bob, salt="other")
+        assert world.reveal(bid, world.bob) == "revealed"
+        assert world.c.get_bid(bid)["price"] == 1000
+        with world.vm.expect_revert("already revealed"):
+            world.reveal(bid, world.bob)
+
+    def test_a_commitment_cannot_be_copied_by_another_bidder(self, world):
+        rid = world.create()
+        victim = world.bid(rid, A_URL, 1000, world.bob, page=GOOD_A, salt="x")
+        copied = world.c.get_bid(victim)["price_commit"]
+        thief = world.bid(rid, B_URL, 1000, world.charlie, page=GOOD_B, commit=copied)
+        world.at(T_REVEAL)
+        with world.vm.expect_revert("commitment mismatch"):
+            world.reveal(thief, world.charlie, price=1000, salt="x")  # it is bound to bob's address
+
+    def test_reveal_window_closes(self, world):
+        rid = world.create()
+        bid = world.bid(rid, A_URL, 1000, world.bob, page=GOOD_A)
+        world.at(7 * DAY + REVEAL + 1)
+        with world.vm.expect_revert("reveal closed"):
+            world.reveal(bid, world.bob)
+
+    def test_evaluation_waits_for_the_reveal_window_to_close(self, world):
+        rid, a, b = two_good_bids(world)
         world.mock_world()
         world.vm.sender = world.charlie
-        with world.vm.expect_revert("bidding still open"):
-            world.c.evaluate_bid(bid)
+        with world.vm.expect_revert("reveal window open"):
+            world.c.evaluate_bid(a)
+        with world.vm.expect_revert("reveal window open"):
+            world.c.settle(rid)
+
+    def test_an_unrevealed_bid_is_never_evaluated_and_is_ineligible(self, world):
+        world.pages.update({A_URL: GOOD_A, B_URL: GOOD_B})
+        rid = world.create()
+        shy = world.bid(rid, A_URL, 1000, world.bob)  # cheapest, but never reveals
+        shown = world.bid(rid, B_URL, 30000, world.charlie)
+        world.at(T_REVEAL)
+        world.reveal(shown, world.charlie)
+        ready(world)
+        world.mock_world()
+        world.vm.sender = world.alice
+        with world.vm.expect_revert("not revealed"):
+            world.c.evaluate_bid(shy)
+        assert world.evaluate(shown) == "eligible"
+        assert world.settle(rid) == "PAID"
+        assert world.paid_to(world.charlie) == POOL + BOND + BOND  # prize + own bond back + the forfeited bond
+        assert world.paid_to(world.bob) == 0
+        conserved(world)
 
 
 class TestEvaluation:
     def test_a_compliant_bid_hits_every_bit(self, world):
         rid, a, _ = two_good_bids(world)
-        after_deadline(world)
+        ready(world)
         assert world.evaluate(a) == "eligible"
         bid = world.c.get_bid(a)
-        assert bid["bits"] == [True] * 5 and bid["eligible"] and bid["fetched"]
+        assert bid["bits"] == [True] * 5 and bid["eligible"] and bid["source"] == "ok"
         assert A_URL in world.requests and REPO in world.requests  # the deliverable was fetched too
 
     @pytest.mark.parametrize(
@@ -110,51 +243,62 @@ class TestEvaluation:
         world.pages[A_URL] = page
         rid = world.create()
         bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         assert world.evaluate(bid, answers) == "ineligible"
         bits = world.c.get_bid(bid)["bits"]
         assert bits[index] is False and sum(bits) == 4
 
-    def test_price_over_the_ceiling_misses(self, world):
+    def test_price_over_the_ceiling_misses_using_the_revealed_price(self, world):
         world.pages[A_URL] = GOOD_A
         rid = world.create()
         bid = world.bid(rid, A_URL, 50001, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         assert world.evaluate(bid) == "ineligible"
         assert world.c.get_bid(bid)["bits"][2] is False
 
     @pytest.mark.parametrize("text", ["Licensed under MIT.", "(MIT)", "license: MIT, see file", "Apache-2.0."])
     def test_license_matches_with_punctuation(self, world, text):
-        world.pages[A_URL] = GOOD_A.replace("Licensed under MIT.", text)
-        rid = world.create()
-        bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
-        world.evaluate(bid)
-        assert world.c.get_bid(bid)["bits"][1] is True
+        self._license(world, GOOD_A.replace("Licensed under MIT.", text), True)
 
     @pytest.mark.parametrize("text", ["MIT-0 only", "Apache-2.0.1", "permitted", "GPL-3.0"])
     def test_license_lookalikes_do_not_match(self, world, text):
-        world.pages[A_URL] = GOOD_A.replace("Licensed under MIT.", text)
-        rid = world.create()
-        bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
-        world.evaluate(bid)
-        assert world.c.get_bid(bid)["bits"][1] is False
+        self._license(world, GOOD_A.replace("Licensed under MIT.", text), False)
 
-    def test_license_match_is_exact_not_a_substring(self, world):
-        world.pages[A_URL] = GOOD_A.replace("MIT", "PERMITTED")
+    @staticmethod
+    def _license(world, page, expected):
+        world.pages[A_URL] = page
         rid = world.create()
         bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         world.evaluate(bid)
-        assert world.c.get_bid(bid)["bits"][1] is False
+        assert world.c.get_bid(bid)["bits"][1] is expected
+
+    def test_the_content_lock_catches_a_page_edited_after_bidding(self, world):
+        world.pages[A_URL] = GOOD_A
+        rid = world.create()
+        bid = world.bid(rid, A_URL, 40000, world.bob)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        world.pages[A_URL] = GOOD_A.replace("Trail of Bits", "someone else")  # edited after the commitment
+        ready(world)
+        assert world.evaluate(bid) == "changed"
+        b = world.c.get_bid(bid)
+        assert b["source"] == "changed" and b["bits"] == [False] * 5 and b["eligible"] is False
+        assert world.llm_prompts == []  # the jury never saw a page that no longer matches its commitment
 
     def test_the_injected_bid_loses_and_cannot_be_talked_into_anything(self, world):
         world.pages[X_URL] = INJECT
         rid = world.create()
         bid = world.bid(rid, X_URL, 100, world.bob)
-        after_deadline(world)
-        # even a jury that answered "true" to the question cannot flip the four code bits
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         assert world.evaluate(bid, [True]) == "ineligible"
         assert world.c.get_bid(bid)["bits"] == [False, False, True, False, True]
         assert "untrusted DATA" in world.llm_prompts[0]
@@ -164,42 +308,47 @@ class TestEvaluation:
         world.pages[A_URL] = attack
         rid = world.create()
         bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         world.evaluate(bid, [False])
         prompt = world.llm_prompts[0]
         assert prompt.count("<<<PAGE") == 1 and prompt.count(">>>") == 1 and "<<<<" not in prompt
-        assert world.c.get_bid(bid)["bits"][4] is False  # the real bits are computed from the true text
+        assert world.c.get_bid(bid)["bits"][4] is False
 
     def test_unavailable_page_retries_then_counts_as_ineligible(self, world):
         world.pages[A_URL] = None
         rid = world.create()
         bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         assert world.evaluate(bid) == "unavailable"
         world.vm.sender = world.charlie
         with world.vm.expect_revert("retry too soon"):
             world.c.evaluate_bid(bid)
-        world.at(8 * DAY + 2 * 3600)
+        world.at(T_EVAL + 2 * HOUR)
         assert world.evaluate(bid) == "unavailable"
-        world.at(8 * DAY + 4 * 3600)
+        world.at(T_EVAL + 4 * HOUR)
         assert world.evaluate(bid) == "ineligible"
-        assert world.c.get_bid(bid)["fetched"] is False and world.c.get_bid(bid)["status"] == "EVALUATED"
+        assert world.c.get_bid(bid)["source"] == "unavailable" and world.c.get_bid(bid)["status"] == "EVALUATED"
 
-    def test_a_bid_page_that_comes_back_is_judged_normally(self, world):
-        world.pages[A_URL] = None
+    def test_a_page_that_comes_back_is_judged_normally(self, world):
+        world.pages[A_URL] = GOOD_A
         rid = world.create()
         bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
+        world.pages[A_URL] = None
         world.evaluate(bid)
         world.pages[A_URL] = GOOD_A
-        world.at(8 * DAY + 2 * 3600)
+        world.at(T_EVAL + 2 * HOUR)
         assert world.evaluate(bid) == "eligible"
 
     def test_bad_model_output_leaves_the_bid_unevaluated(self, world):
-        world.pages[A_URL] = GOOD_A
-        rid = world.create()
-        bid = world.bid(rid, A_URL, 40000, world.bob)
-        after_deadline(world)
+        rid, a, _ = two_good_bids(world)
+        ready(world)
         for bad in ('{"answers": []}', '{"answers": ["yes"]}', "not json"):
             world.mock_world()
             world.vm.clear_mocks()
@@ -207,93 +356,117 @@ class TestEvaluation:
             world.vm.mock_llm(r"SEALED_BIT", bad)
             world.vm.sender = world.charlie
             with world.vm.expect_revert("bad judgment"):
-                world.c.evaluate_bid(bid)
-        assert world.c.get_bid(bid)["status"] == "PENDING"
+                world.c.evaluate_bid(a)
+        assert world.c.get_bid(a)["status"] == "REVEALED"
 
     def test_evaluating_twice_is_refused(self, world):
         rid, a, _ = two_good_bids(world)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.vm.sender = world.charlie
         with world.vm.expect_revert("already evaluated"):
             world.c.evaluate_bid(a)
 
 
-class TestSettlement:
-    def test_none_eligible_refunds_the_sponsor(self, world):
+class TestSettlementAndBonds:
+    def test_none_eligible_refunds_the_sponsor_and_every_bond(self, world):
         world.pages[X_URL] = INJECT
         rid = world.create()
         bid = world.bid(rid, X_URL, 100, world.bob)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(bid, world.bob)
+        ready(world)
         world.evaluate(bid)
-        world.vm.sender = world.charlie
-        assert world.c.settle(rid) == "REFUNDED"
-        assert world.paid_to(world.alice) == POOL and world.total_paid() == POOL
+        assert world.settle(rid) == "REFUNDED"
+        assert world.paid_to(world.alice) == POOL and world.paid_to(world.bob) == BOND  # nobody is punished
+        r = world.c.get_rfp(rid)
+        assert r["forfeited"] == 0 and r["returned"] == [{"bid_id": bid, "amount": BOND}]
+        conserved(world)
 
     def test_no_bids_at_all_refunds(self, world):
         rid = world.create()
-        after_deadline(world)
-        world.vm.sender = world.charlie
-        assert world.c.settle(rid) == "REFUNDED"
+        ready(world)
+        assert world.settle(rid) == "REFUNDED"
         assert world.paid_to(world.alice) == POOL
+        conserved(world)
 
-    def test_one_eligible_is_paid_in_full(self, world):
+    def test_the_winner_gets_the_prize_and_the_forfeited_bonds_of_failed_bids(self, world):
         world.pages.update({A_URL: GOOD_A, X_URL: INJECT})
         rid = world.create()
         good = world.bid(rid, A_URL, 40000, world.bob)
         bad = world.bid(rid, X_URL, 1, world.charlie)  # the cheapest bid, and the one that begs
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(good, world.bob)
+        world.reveal(bad, world.charlie)
+        ready(world)
         world.evaluate(good)
         world.evaluate(bad)
-        world.vm.sender = world.alice  # the sponsor's own wallet changes nothing
-        assert world.c.settle(rid) == "PAID"
-        assert world.paid_to(world.bob) == POOL and world.paid_to(world.charlie) == 0 and world.paid_to(world.alice) == 0
+        assert world.settle(rid, sender=world.alice) == "PAID"  # the sponsor's own wallet changes nothing
+        assert world.paid_to(world.bob) == POOL + BOND + BOND  # prize + forfeited bond + own bond back
+        assert world.paid_to(world.charlie) == 0 and world.paid_to(world.alice) == 0
         r = world.c.get_rfp(rid)
-        assert r["status"] == "SETTLED" and r["winners"] == [{"bid_id": good, "amount": POOL}]
+        assert r["status"] == "SETTLED" and r["forfeited"] == BOND
+        assert r["winners"] == [{"bid_id": good, "amount": POOL + BOND}]
+        conserved(world)
 
-    def test_lowest_price_wins_among_eligible(self, world):
+    def test_the_sponsor_never_receives_a_bond(self, world):
+        world.pages.update({A_URL: GOOD_A, X_URL: INJECT})
+        rid = world.create()
+        good = world.bid(rid, A_URL, 40000, world.bob)
+        bad = world.bid(rid, X_URL, 1, world.charlie)
+        world.at(T_REVEAL)
+        world.reveal(good, world.bob)
+        world.reveal(bad, world.charlie)
+        ready(world)
+        world.evaluate(good)
+        world.evaluate(bad)
+        world.settle(rid)
+        assert world.paid_to(world.alice) == 0
+
+    def test_lowest_revealed_price_wins_among_eligible(self, world):
         rid, a, b = two_good_bids(world, 40000, 30000)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.evaluate(b)
-        world.vm.sender = world.alice
-        assert world.c.settle(rid) == "PAID"
-        assert world.paid_to(world.charlie) == POOL and world.paid_to(world.bob) == 0
+        assert world.settle(rid, sender=world.alice) == "PAID"
+        assert world.paid_to(world.charlie) == POOL + BOND and world.paid_to(world.bob) == BOND
+        conserved(world)
 
     def test_equal_lowest_prices_split(self, world):
         rid, a, b = two_good_bids(world, 30000, 30000)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.evaluate(b)
-        world.vm.sender = world.charlie
-        assert world.c.settle(rid) == "SPLIT"
-        assert world.paid_to(world.bob) == POOL // 2 and world.paid_to(world.charlie) == POOL // 2
+        assert world.settle(rid) == "SPLIT"
+        assert world.paid_to(world.bob) == POOL // 2 + BOND and world.paid_to(world.charlie) == POOL // 2 + BOND
+        conserved(world)
 
-    def test_split_rule_divides_among_all_eligible_with_the_remainder_to_the_first(self, world):
+    def test_split_rule_divides_among_all_eligible(self, world):
         rid, a, b = two_good_bids(world, 40000, 30000, tie="split")
-        world.at(0)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.evaluate(b)
-        world.vm.sender = world.charlie
-        assert world.c.settle(rid) == "SPLIT"
-        assert world.total_paid() == POOL
+        assert world.settle(rid) == "SPLIT"
+        conserved(world)
 
     def test_odd_pool_conserves_every_unit(self, world):
         world.pages.update({A_URL: GOOD_A, B_URL: GOOD_B})
         rid = world.create(pool=90001, tie="split")
         a = world.bid(rid, A_URL, 40000, world.bob)
         b = world.bid(rid, B_URL, 30000, world.charlie)
-        after_deadline(world)
+        world.at(T_REVEAL)
+        world.reveal(a, world.bob)
+        world.reveal(b, world.charlie)
+        ready(world)
         world.evaluate(a)
         world.evaluate(b)
-        world.vm.sender = world.charlie
-        world.c.settle(rid)
-        assert world.total_paid() == 90001 and world.paid_to(world.bob) == 45001
+        world.settle(rid)
+        conserved(world)
+        assert world.paid_to(world.bob) == 45001 + BOND
 
-    def test_settlement_waits_for_every_bid_to_be_evaluated(self, world):
+    def test_settlement_waits_for_every_revealed_bid_to_be_evaluated(self, world):
         rid, a, b = two_good_bids(world)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.vm.sender = world.charlie
         with world.vm.expect_revert("bids awaiting evaluation"):
@@ -301,25 +474,53 @@ class TestSettlement:
 
     def test_stalled_bids_count_as_ineligible_after_the_review_window(self, world):
         rid, a, b = two_good_bids(world)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
-        world.at(8 * DAY + 31 * DAY)
-        world.vm.sender = world.charlie
-        assert world.c.settle(rid) == "PAID"
-        assert world.paid_to(world.bob) == POOL
+        world.at(T_EVAL + 31 * DAY)
+        assert world.settle(rid) == "PAID"
+        assert world.paid_to(world.bob) == POOL + 2 * BOND  # b was never judged, so its bond is forfeited
+        conserved(world)
 
-    def test_cannot_settle_early_or_twice(self, world):
+    def test_cannot_settle_twice(self, world):
         rid, a, b = two_good_bids(world)
-        world.vm.sender = world.alice
-        with world.vm.expect_revert("bidding still open"):
-            world.c.settle(rid)
-        after_deadline(world)
+        ready(world)
         world.evaluate(a)
         world.evaluate(b)
-        world.c.settle(rid)
+        world.settle(rid)
+        world.vm.sender = world.alice
         with world.vm.expect_revert("already settled"):
             world.c.settle(rid)
-        assert world.total_paid() == POOL
+        conserved(world)
+
+
+class TestConservationProperty:
+    """For every mix of two bidders the contract pays out exactly what it received; the sponsor never gets a bond."""
+
+    @pytest.mark.parametrize(
+        "plan",
+        [["good", "good"], ["bad", "bad"], ["good", "bad"], ["shy", "good"], ["shy", "shy"], ["good", "shy"], ["good"], ["bad"]],
+    )
+    @pytest.mark.parametrize("tie", ["lowest", "split"])
+    def test_every_unit_is_accounted_for(self, world, plan, tie):
+        world.pages["https://bids.example.org/good"] = GOOD_A
+        world.pages[X_URL] = INJECT
+        rid = world.create(pool=77777, tie=tie)
+        entries = []
+        for i, kind in enumerate(plan):
+            sender = [world.bob, world.charlie][i]
+            url = X_URL if kind == "bad" else "https://bids.example.org/good"
+            entries.append((kind, world.bid(rid, url, 1000 + 500 * i, sender), sender))
+        world.at(T_REVEAL)
+        for kind, bid, sender in entries:
+            if kind != "shy":
+                world.reveal(bid, sender)
+        ready(world)
+        for kind, bid, sender in entries:
+            if kind != "shy":
+                world.evaluate(bid, [True])
+        world.settle(rid)
+        conserved(world)
+        assert world.paid_to(world.alice) in (0, 77777)
 
 
 class TestAwardRule:
@@ -339,5 +540,4 @@ class TestAwardRule:
     def test_decide_award(self, world, eligible, rule, expected):
         import sys
 
-        mod = sys.modules["_contract_sealed"]
-        assert mod.decide_award(eligible, rule, 100) == expected
+        assert sys.modules["_contract_sealed"].decide_award(eligible, rule, 100) == expected
