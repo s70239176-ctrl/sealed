@@ -22,7 +22,7 @@ yes/no fact about the page and the only model-judged kind. Taste words are refus
 ## Deployment (GenLayer Studio, `studionet`, chain id 61999)
 
 - RPC: https://studio.genlayer.com/api
-- Contract (v2): `0x364F0979E0e7CE27f6AF8eC5AC9Ecf05967D96Be` (retry gap 60 s)
+- Contract (current, v3 with `recheck_bid`, `get_receipt`, `list_rfps`): `0x6Bb104dcB1729037aCa3AC1216B4002251dd7D80` (retry gap 60 s). The v2 contract `0x364F...96Be` ran the four-bid log below.
 - Live run: [docs/e2e-v2.log](docs/e2e-v2.log). Four bids: A orders the jury to answer true, B tries to close the page
   block and forge the answer JSON, C honestly names an auditor and is the dearest, D is the cheapest and compliant but
   never reveals. A and B fail only the auditor bit, D is ineligible, C is paid the 3000 pool plus 300 of forfeited
@@ -32,8 +32,24 @@ yes/no fact about the page and the only model-judged kind. Taste words are refus
 ## Run
 
     pip install -r requirements.txt
-    PYTHONPATH=scripts python -m pytest -p windows_direct_plugin   # 90 tests (drop the plugin off Windows)
+    PYTHONPATH=scripts python -m pytest -p windows_direct_plugin   # 95 tests (drop the plugin off Windows)
     npm install && node scripts/deploy.mjs 60 && node scripts/e2e-v2.mjs
+
+## Web app (`web/`)
+
+React + TypeScript + Vite, `genlayer-js@1.1.8`, no backend. Pages: RFP list, **create** (template picker, live criteria linter,
+dry run on a sample page, funding), **RFP** (stage timeline, sealed bid with in-browser page fingerprint, reveal, "Run the
+jury" per bid with the validator votes and appeal window, settle), and a shareable **receipt** (frozen terms and fingerprint,
+bit matrix, outcome, and "Re-run the check" which records an audit result without ever changing eligibility or payout).
+Wallet: an EIP-1193 wallet (MetaMask) or a throwaway demo key. A bid's price and secret word are kept in this browser
+and shown to the bidder so they can reveal.
+
+    cd web && npm install && echo VITE_CONTRACT_ADDRESS=0x... > .env.local && npm run dev
+    npm test            # 8 tests: decoding, commitments, templates, and that every contract refusal has a message
+    node --experimental-strip-types ../scripts/parity.mjs   # browser hashing vs the live contract (10 cases)
+
+Driven end to end through the UI on live Studionet (RFP 1 on the current contract): create, bid, reveal, jury, settle, and
+re-check; the bidder ended with the 3 GEN prize plus its 0.1 GEN bond and the contract at 0.
 
 ## Client notes
 
@@ -46,4 +62,5 @@ Payouts land when the settling transaction FINALIZES, not at ACCEPTED.
 The `question` word-list taste filter is a floor, not a proof. Injection resistance is evidence from a few live runs,
 not an audit. A page that never loads after 3 attempts is ineligible. A sponsor can still bid from a second wallet
 (the receipt page should surface same-funder patterns). Demo bid pages are served by httpbin.org/base64. Studionet is
-a test network, there is no frontend yet, and no external review has been done.
+a test network and no external review has been done. The app has not been tested with a real MetaMask yet (only the demo key),
+and the page fingerprint is computed in the browser, so a site that blocks cross-origin reads needs the bidder to paste the page source.
