@@ -1,5 +1,7 @@
 # Sealed
 
+**Live app:** https://s70239176-ctrl.github.io/sealed/ · **Example receipt:** https://s70239176-ctrl.github.io/sealed/#/rfp/1/receipt (Studionet test network)
+
 An RFP whose sponsor provably could not steer the award. The sponsor locks funds and freezes typed yes/no
 criteria before any bid exists; a jury of GenLayer validators fetches each bid page and agrees on the exact bit
 vector; the payout is a table in code. No admin key, and the sponsor cannot cancel, edit, pick a winner or bid.
@@ -59,9 +61,8 @@ Payouts land when the settling transaction FINALIZES, not at ACCEPTED.
 
 ## Hosting and the wallet test
 
-`ci/` holds GitHub Actions templates (CI, GitHub Pages) and `web/vercel.json` the Vercel config; see `ci/README.md`.
-`docs/METAMASK-CHECKLIST.md` is the 11-step walkthrough for a person with MetaMask. Neither has been run: this repo has no
-remote, and the build tooling cannot drive a browser-extension wallet.
+The app is served from the `gh-pages` branch (built with `VITE_CONTRACT_ADDRESS` set; rebuild and force-push `web/dist` there to update it). `ci/` holds GitHub Actions templates (CI, GitHub Pages) and `web/vercel.json` the Vercel config; see `ci/README.md`. The workflows are not active because the token used to publish this repo lacks the `workflow` scope.
+`docs/METAMASK-CHECKLIST.md` is the 11-step walkthrough for a person with MetaMask. The wallet walkthrough has not been run: the build tooling cannot drive a browser-extension wallet.
 
 ## Known limits
 
