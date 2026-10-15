@@ -61,6 +61,9 @@ Payouts land when the settling transaction FINALIZES, not at ACCEPTED.
 
 ## Hosting and the wallet test
 
+**Vercel:** import the repo and set the project's Root Directory to `web`. No environment variable is needed: the app defaults to the
+contract above. Set `VITE_CONTRACT_ADDRESS` only to point it at a different deployment.
+
 The app is served from the `gh-pages` branch (built with `VITE_CONTRACT_ADDRESS` set; rebuild and force-push `web/dist` there to update it). `ci/` holds GitHub Actions templates (CI, GitHub Pages) and `web/vercel.json` the Vercel config; see `ci/README.md`. The workflows are not active because the token used to publish this repo lacks the `workflow` scope.
 `docs/METAMASK-CHECKLIST.md` is the 11-step walkthrough for a person with MetaMask. The wallet walkthrough has not been run: the build tooling cannot drive a browser-extension wallet.
 

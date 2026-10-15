@@ -14,7 +14,12 @@ export { describeError } from "./decode.ts";
 
 type Hex = `0x${string}`;
 
-export const CONTRACT = (import.meta.env.VITE_CONTRACT_ADDRESS as string | undefined)?.trim() ?? "";
+/**
+ * The Sealed contract on Studionet this app was built against. VITE_CONTRACT_ADDRESS overrides it (for a redeploy or another
+ * network), so a host that sets no environment variable, such as a plain Vercel import, still gets a working app.
+ */
+export const DEFAULT_CONTRACT = "0x6Bb104dcB1729037aCa3AC1216B4002251dd7D80";
+export const CONTRACT = (import.meta.env.VITE_CONTRACT_ADDRESS as string | undefined)?.trim() || DEFAULT_CONTRACT;
 export const hasContract = /^0x[0-9a-fA-F]{40}$/.test(CONTRACT) && !/^0x0+$/.test(CONTRACT);
 export const NETWORK = studionet.name;
 export const EXPLORER = studionet.blockExplorers?.default.url ?? "https://explorer-studio.genlayer.com";
