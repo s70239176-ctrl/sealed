@@ -493,6 +493,58 @@ class TestSettlementAndBonds:
         conserved(world)
 
 
+class TestAuditAndReads:
+    def _settled(self, world):
+        rid, a, b = two_good_bids(world, 40000, 30000)
+        ready(world)
+        world.evaluate(a)
+        world.evaluate(b)
+        world.settle(rid)
+        return rid, a, b
+
+    def test_recheck_matches_and_changes_nothing(self, world):
+        rid, a, b = self._settled(world)
+        before = world.c.get_rfp(rid)
+        paid = world.total_paid()
+        world.mock_world()
+        world.vm.sender = world.alice  # even the sponsor can run it; it cannot matter
+        assert world.c.recheck_bid(a) == "match"
+        info = world.c.get_bid(a)["recheck"]
+        assert info["count"] == 1 and info["matches"] is True and info["source"] == "ok"
+        assert world.c.recheck_bid(a) == "match" and world.c.get_bid(a)["recheck"]["count"] == 2
+        assert world.c.get_rfp(rid) == before and world.total_paid() == paid  # nothing moved, nothing changed
+        assert world.c.get_bid(a)["eligible"] is True
+
+    def test_recheck_reports_a_page_that_changed_later_but_never_flips_eligibility(self, world):
+        rid, a, b = self._settled(world)
+        world.pages[A_URL] = GOOD_A.replace("Trail of Bits", "nobody")
+        world.mock_world()
+        world.vm.sender = world.charlie
+        assert world.c.recheck_bid(a) == "differs"
+        info = world.c.get_bid(a)["recheck"]
+        assert info["matches"] is False and info["source"] == "changed"
+        assert world.c.get_bid(a)["eligible"] is True and world.c.get_rfp(rid)["status"] == "SETTLED"
+
+    def test_recheck_needs_an_evaluated_bid(self, world):
+        rid, a, b = two_good_bids(world)
+        world.vm.sender = world.charlie
+        with world.vm.expect_revert("not evaluated"):
+            world.c.recheck_bid(a)
+
+    def test_receipt_returns_the_rfp_and_every_bid_in_one_read(self, world):
+        rid, a, b = self._settled(world)
+        rec = world.c.get_receipt(rid)
+        assert rec["rfp"]["id"] == rid and rec["rfp"]["outcome"] == "PAID"
+        assert [x["id"] for x in rec["bids"]] == [a, b] and rec["bids"][0]["bits"] == [True] * 5
+
+    def test_list_rfps_is_newest_first_and_paged(self, world):
+        ids = [world.create() for _ in range(3)]
+        page = world.c.list_rfps(0, 2)
+        assert page["total"] == 3 and [i["id"] for i in page["items"]] == [ids[2], ids[1]]
+        assert [i["id"] for i in world.c.list_rfps(2, 5)["items"]] == [ids[0]]
+        assert world.c.list_rfps(0, 99)["items"][0]["criteria_count"] == len(CRITERIA)
+
+
 class TestConservationProperty:
     """For every mix of two bidders the contract pays out exactly what it received; the sponsor never gets a bond."""
 

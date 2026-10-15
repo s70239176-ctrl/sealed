@@ -399,6 +399,7 @@ class Bid:
     attempts: u256
     last_attempt_at: u256
     created_at: u256
+    recheck_json: str  # "" or {"count", "matches", "at", "source"}: a public audit trail, never affects eligibility
 
 
 class Sealed(gl.Contract):
@@ -443,6 +444,30 @@ class Sealed(gl.Contract):
             _fail("unknown bid")
         return self.bids[bid_id]
 
+    def _jury(self, r: Rfp, b: Bid) -> dict:
+        """The leader and every validator each fetch the page and must agree on the exact result."""
+        criteria = json.loads(r.criteria_json)
+        url, price, committed = str(b.url), int(b.price), str(b.content_hash)
+
+        def leader_fn():
+            mine = _judge(criteria, price, url, committed)
+            return mine if mine is not None else {"invalid": True}
+
+        def validator_fn(leader_res) -> bool:
+            if not isinstance(leader_res, gl.vm.Return):
+                return False
+            lead = normalize_result(leader_res.calldata, len(criteria))
+            if lead is None or lead != leader_res.calldata:
+                return False
+            mine = _judge(criteria, price, url, committed)
+            return mine is not None and lead == mine
+
+        env = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        result = normalize_result(env, len(criteria))
+        if result is None or result != env:
+            _fail("bad judgment")
+        return result
+
     def _bid_view(self, bid_id, b: Bid) -> dict:
         done = b.status == B_EVALUATED
         revealed = int(b.price) > 0
@@ -461,6 +486,7 @@ class Sealed(gl.Contract):
             "eligible": b.eligible if done else None,
             "attempts": int(b.attempts),
             "created_at": int(b.created_at),
+            "recheck": json.loads(b.recheck_json) if b.recheck_json != "" else None,
         }
 
     def _rfp_view(self, rfp_id, r: Rfp) -> dict:
@@ -575,6 +601,7 @@ class Sealed(gl.Contract):
             attempts=u256(0),
             last_attempt_at=u256(0),
             created_at=u256(now),
+            recheck_json="",
         )
         self.bidder_keys[key] = u256(1)
         ids.append(int(bid_id))
@@ -617,26 +644,7 @@ class Sealed(gl.Contract):
             _fail("already evaluated")
         if int(b.attempts) > 0 and now < int(b.last_attempt_at) + int(self.retry_gap):
             _fail("retry too soon")
-        criteria = json.loads(r.criteria_json)
-        url, price, committed = str(b.url), int(b.price), str(b.content_hash)
-
-        def leader_fn():
-            mine = _judge(criteria, price, url, committed)
-            return mine if mine is not None else {"invalid": True}
-
-        def validator_fn(leader_res) -> bool:
-            if not isinstance(leader_res, gl.vm.Return):
-                return False
-            lead = normalize_result(leader_res.calldata, len(criteria))
-            if lead is None or lead != leader_res.calldata:
-                return False
-            mine = _judge(criteria, price, url, committed)
-            return mine is not None and lead == mine
-
-        env = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
-        result = normalize_result(env, len(criteria))
-        if result is None or result != env:
-            _fail("bad judgment")
+        result = self._jury(r, b)
         if result["source"] == SRC_UNAVAILABLE:
             b.attempts = u256(int(b.attempts) + 1)
             b.last_attempt_at = u256(now)
@@ -647,6 +655,24 @@ class Sealed(gl.Contract):
         b.eligible = is_eligible(result["source"], result["bits"])
         b.status = B_EVALUATED
         return "eligible" if b.eligible else ("changed" if result["source"] == SRC_CHANGED else "ineligible")
+
+    @gl.public.write
+    def recheck_bid(self, bid_id: u256) -> str:
+        """
+        Anyone, at any time after a bid was evaluated: run the jury again and record whether it still sees the same
+        thing. This is an audit trail. It NEVER changes eligibility, a payout or a settled RFP.
+        """
+        b = self._bid(bid_id)
+        r = self._rfp(b.rfp_id)
+        if b.status != B_EVALUATED:
+            _fail("not evaluated")
+        result = self._jury(r, b)
+        matches = result["source"] == b.source and result["bits"] == json.loads(b.bits_json)
+        prior = json.loads(b.recheck_json) if b.recheck_json != "" else {"count": 0}
+        b.recheck_json = json.dumps(
+            {"count": int(prior["count"]) + 1, "matches": matches, "at": self._now(), "source": result["source"]}
+        )
+        return "match" if matches else "differs"
 
     @gl.public.write
     def settle(self, rfp_id: u256) -> str:
@@ -701,6 +727,40 @@ class Sealed(gl.Contract):
     @gl.public.view
     def get_bid(self, bid_id: u256) -> dict:
         return self._bid_view(bid_id, self._bid(bid_id))
+
+    @gl.public.view
+    def get_receipt(self, rfp_id: u256) -> dict:
+        """One read for a whole RFP: the frozen terms, every bid, the bits and the payout (the receipt page)."""
+        r = self._rfp(rfp_id)
+        bids = [self._bid_view(i, self.bids[u256(i)]) for i in json.loads(r.bid_ids_json)]
+        return {"rfp": self._rfp_view(rfp_id, r), "bids": bids}
+
+    @gl.public.view
+    def list_rfps(self, offset: u256, limit: u256) -> dict:
+        """Newest first, compact, one read for the home page."""
+        total = int(self.next_rfp_id) - 1
+        lim = max(1, min(int(limit), 30))
+        items = []
+        i = total - int(offset)
+        while i >= 1 and len(items) < lim:
+            r = self.rfps[u256(i)]
+            items.append(
+                {
+                    "id": i,
+                    "title": r.title,
+                    "pool": int(r.pool),
+                    "bond": int(r.bond),
+                    "status": r.status,
+                    "outcome": r.outcome,
+                    "tie_rule": r.tie_rule,
+                    "bid_deadline": int(r.bid_deadline),
+                    "reveal_deadline": int(r.reveal_deadline),
+                    "bid_count": len(json.loads(r.bid_ids_json)),
+                    "criteria_count": len(json.loads(r.criteria_json)),
+                }
+            )
+            i -= 1
+        return {"total": total, "items": items}
 
     @gl.public.view
     def get_count(self) -> int:
