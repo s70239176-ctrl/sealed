@@ -57,10 +57,17 @@ re-check; the bidder ended with the 3 GEN prize plus its 0.1 GEN bond and the co
 use `simulateWriteContract` for `lint_criteria` and `dry_run` (see `sim()` in `scripts/chain-lib.mjs`).
 Payouts land when the settling transaction FINALIZES, not at ACCEPTED.
 
+## Hosting and the wallet test
+
+`ci/` holds GitHub Actions templates (CI, GitHub Pages) and `web/vercel.json` the Vercel config; see `ci/README.md`.
+`docs/METAMASK-CHECKLIST.md` is the 11-step walkthrough for a person with MetaMask. Neither has been run: this repo has no
+remote, and the build tooling cannot drive a browser-extension wallet.
+
 ## Known limits
 
 The `question` word-list taste filter is a floor, not a proof. Injection resistance is evidence from a few live runs,
-not an audit. A page that never loads after 3 attempts is ineligible. A sponsor can still bid from a second wallet
-(the receipt page should surface same-funder patterns). Demo bid pages are served by httpbin.org/base64. Studionet is
+not an audit. A page that never loads after 3 attempts is ineligible. A sponsor can still bid from a second wallet,
+and the contract cannot see who funded a wallet (Studionet accounts are gasless), so the app cannot flag it; the sponsor's
+address is shown on every RFP and receipt so others can judge for themselves. Demo bid pages are served by httpbin.org/base64. Studionet is
 a test network and no external review has been done. The app has not been tested with a real MetaMask yet (only the demo key),
 and the page fingerprint is computed in the browser, so a site that blocks cross-origin reads needs the bidder to paste the page source.
