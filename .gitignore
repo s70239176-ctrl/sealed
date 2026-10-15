@@ -6,3 +6,5 @@ node_modules/
 web/dist/
 web/vite.log
 web/node_modules/
+.env.local
+web/.env.local
